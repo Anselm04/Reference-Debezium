@@ -1,0 +1,234 @@
+/*
+ * Copyright Debezium Authors.
+ *
+ * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
+ */
+package io.debezium.connector.mongodb.connection;
+
+import java.util.HashSet;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import org.bson.BsonBoolean;
+import org.bson.BsonDocument;
+import org.bson.BsonInt32;
+import org.bson.codecs.Decoder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.mongodb.ConnectionString;
+import com.mongodb.ReadConcern;
+import com.mongodb.ReadPreference;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.internal.MongoClientImpl;
+import com.mongodb.connection.ClusterDescription;
+import com.mongodb.connection.ClusterType;
+import com.mongodb.event.ClusterDescriptionChangedEvent;
+import com.mongodb.event.ClusterListener;
+import com.mongodb.internal.operation.ListCollectionsOperation;
+
+import io.debezium.config.Configuration;
+import io.debezium.connector.mongodb.MongoDbConnectorConfig;
+import io.debezium.connector.mongodb.MongoUtils;
+import io.debezium.connector.mongodb.connection.client.DefaultMongoDbClientFactory;
+import io.debezium.connector.mongodb.connection.client.MongoDbClient;
+import io.debezium.connector.mongodb.connection.client.MongoDbClientFactory;
+
+/**
+ * @author Randall Hauch
+ *
+ */
+public class MongoDbConnectionContext implements AutoCloseable {
+
+    private static final Logger LOGGER = LoggerFactory.getLogger(MongoDbConnectionContext.class);
+
+    private final MongoDbConnectorConfig connectorConfig;
+    private final MongoDbClientFactory clientFactory;
+
+    /**
+     * @param config the configuration
+     */
+    public MongoDbConnectionContext(Configuration config) {
+        this.connectorConfig = new MongoDbConnectorConfig(config);
+        this.clientFactory = new DefaultMongoDbClientFactory(config);
+    }
+
+    public MongoDbConnectorConfig getConnectorConfig() {
+        return connectorConfig;
+    }
+
+    public ConnectionString getConnectionString() {
+        return connectorConfig.getConnectionString();
+    }
+
+    /**
+     * Same as {@link #getConnectionString()} but masks sensitive information
+     *
+     * @return masked connection string
+     */
+    public String getMaskedConnectionString() {
+        return ConnectionStrings.mask(getConnectionString());
+    }
+
+    /**
+     * Checks server availability without requiring permission to list databases.
+     * The validation client is always closed before returning.
+     */
+    public boolean canConnect() throws InterruptedException {
+        final var connected = new CountDownLatch(1);
+        final var readPreference = Optional.ofNullable(getConnectionString().getReadPreference())
+                .orElse(ReadPreference.primaryPreferred());
+        final var listener = new ClusterListener() {
+            @Override
+            public void clusterDescriptionChanged(ClusterDescriptionChangedEvent event) {
+                if (event.getNewDescription().hasReadableServer(readPreference)) {
+                    connected.countDown();
+                }
+            }
+        };
+        final long timeout = clientFactory.getMongoClientSettings().getSocketSettings().getConnectTimeout(TimeUnit.MILLISECONDS) + 500L;
+        try (var client = clientFactory.openClient(listener)) {
+            return connected.await(timeout, TimeUnit.MILLISECONDS);
+        }
+    }
+
+    @Override
+    public void close() {
+        clientFactory.close();
+    }
+
+    public MongoDbClient openClient() {
+        return clientFactory.openClient();
+    }
+
+    public void forEachCollectionNameInDatabase(MongoClient client, String databaseName, Consumer<String> operation) {
+        // Remove this internal API workaround once the driver supports explicit read preference for collection enumeration:
+        // https://jira.mongodb.org/browse/DRIVERS-1186
+        var nativeClient = nativeClient(client);
+        var listCollections = newListCollectionsOperation(nativeClient, databaseName)
+                .nameOnly(true)
+                .retryReads(nativeClient.getSettings().getRetryReads());
+
+        try (var cursor = nativeClient.getOperationExecutor().execute(
+                listCollections,
+                client.getReadPreference(),
+                ReadConcern.DEFAULT)) {
+            while (cursor.hasNext()) {
+                cursor.next().stream()
+                        .map(collection -> collection.getString("name").getValue())
+                        .forEach(operation);
+            }
+        }
+    }
+
+    public void forEachDatabaseName(MongoClient client, Consumer<String> operation) {
+        var command = new BsonDocument("listDatabases", new BsonInt32(1))
+                .append("nameOnly", BsonBoolean.TRUE);
+        var result = client.getDatabase("admin")
+                .withReadConcern(ReadConcern.DEFAULT)
+                .runCommand(command, client.getReadPreference(), BsonDocument.class);
+        result.getArray("databases").stream()
+                .map(database -> database.asDocument().getString("name").getValue())
+                .forEach(operation);
+    }
+
+    public ClusterDescription getClusterDescription() {
+        try (var client = openClient()) {
+            LOGGER.info("Reading description of cluster at {}", getMaskedConnectionString());
+            return MongoUtils.clusterDescription(client.getClient());
+        }
+    }
+
+    public ClusterType getClusterType() {
+        return getClusterDescription().getType();
+    }
+
+    public boolean isShardedCluster() {
+        return ClusterType.SHARDED == getClusterType();
+    }
+
+    public Set<String> getShardNames() {
+        if (!isShardedCluster()) {
+            return Set.of();
+        }
+
+        var shardNames = new HashSet<String>();
+        try (var client = openClient()) {
+            var shards = client.getClient().getDatabase("config").getCollection("shards");
+            try (var cursor = shards.find().iterator()) {
+                while (cursor.hasNext()) {
+                    shardNames.add(cursor.next().getString("_id"));
+                }
+            }
+        }
+        catch (Throwable t) {
+            shardNames.clear();
+            LOGGER.warn("Unable to read shard topology.", t);
+        }
+        return shardNames;
+    }
+
+    /**
+     * @return Value specified by {@link ConnectionString#getRequiredReplicaSetName()} or empty optional
+     */
+    public Optional<String> getRequiredReplicaSetName() {
+        return Optional.of(getConnectionString()).map(ConnectionString::getRequiredReplicaSetName);
+    }
+
+    /**
+     * Determines if RS name is specified when required
+     *
+     * @return True if RS name is specified or not required. False otherwise.
+     */
+    public boolean hasReplicaSetNameIfRequired() {
+        if (getRequiredReplicaSetName().isPresent()) {
+            return true;
+        }
+        return getClusterDescription().getType() != ClusterType.REPLICA_SET;
+    }
+
+    /**
+     * Creates the operation in a way that works with both the older driver versions that expose
+     * {@code ListCollectionsOperation(String, Decoder)} and the newer ones that require
+     * {@code ListCollectionsOperation(String, Decoder, Integer)} with the maximum adaptive retries
+     * taken from {@code MongoClientSettings#getMaxAdaptiveRetries()}.
+     * Both the constructor and the settings getter are driver API that differs between driver versions,
+     * so they are resolved reflectively.
+     */
+    @SuppressWarnings("unchecked")
+    private static ListCollectionsOperation<BsonDocument> newListCollectionsOperation(MongoClientImpl nativeClient, String databaseName) {
+        final var decoder = nativeClient.getCodecRegistry().get(BsonDocument.class);
+        try {
+            final var settings = nativeClient.getSettings();
+            try {
+                final var constructor = ListCollectionsOperation.class.getConstructor(String.class, Decoder.class, Integer.class);
+                final var maxAdaptiveRetries = settings.getClass().getMethod("getMaxAdaptiveRetries").invoke(settings);
+                return (ListCollectionsOperation<BsonDocument>) constructor.newInstance(databaseName, decoder, maxAdaptiveRetries);
+            }
+            catch (NoSuchMethodException e) {
+                final var constructor = ListCollectionsOperation.class.getConstructor(String.class, Decoder.class);
+                return (ListCollectionsOperation<BsonDocument>) constructor.newInstance(databaseName, decoder);
+            }
+        }
+        catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Unable to create the collection listing operation with the MongoDB driver in use", e);
+        }
+    }
+
+    private static MongoClientImpl nativeClient(MongoClient client) {
+        if (client instanceof MongoClientImpl nativeClient) {
+            return nativeClient;
+        }
+        throw new UnsupportedMongoClientException(client);
+    }
+
+    static final class UnsupportedMongoClientException extends IllegalArgumentException {
+
+        private UnsupportedMongoClientException(MongoClient client) {
+            super("MongoDB collection metadata operations require a driver-native MongoClient, but received " + client.getClass().getName());
+        }
+    }
+}
